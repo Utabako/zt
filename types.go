@@ -1,6 +1,9 @@
 package zt
 
-import "net/netip"
+import (
+	"errors"
+	"net/netip"
+)
 
 // NodeConfig contains node-wide configuration options.
 type NodeConfig struct {
@@ -9,6 +12,11 @@ type NodeConfig struct {
 	// LowBandwidthMode reduces keepalive and path sensing traffic.
 	LowBandwidthMode bool
 }
+
+var (
+	ErrLocalInterfaceAddressRejected = errors.New("local interface address rejected")
+	ErrUserMessageRejected           = errors.New("user message rejected")
+)
 
 // --- Constants ---
 
@@ -151,6 +159,17 @@ const (
 	NetworkTypePublic  VirtualNetworkType = 1
 )
 
+func (t VirtualNetworkType) String() string {
+	switch t {
+	case NetworkTypePrivate:
+		return "PRIVATE"
+	case NetworkTypePublic:
+		return "PUBLIC"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // VirtualNetworkConfigOperation represents a network config update type.
 type VirtualNetworkConfigOperation int
 
@@ -291,12 +310,6 @@ type VirtualNetworkConfig struct {
 	SSOState                 string
 	SSOClientID              string
 	SSOProvider              string
-}
-
-// NodeStatistics contains internal node traffic statistics.
-type NodeStatistics struct {
-	InVerbCounts [32]uint64
-	InVerbBytes  [32]uint64
 }
 
 // PeerPhysicalPath represents a physical network path to a peer.

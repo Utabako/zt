@@ -8,6 +8,7 @@ package zt
 import "C"
 
 import (
+	"fmt"
 	"net/netip"
 	"runtime/cgo"
 	"unsafe"
@@ -50,6 +51,10 @@ type NodeCallbacks struct {
 	// PathLookup returns a physical address hint for reaching a ZeroTier address.
 	// Return nil if no hint is available. Optional.
 	PathLookup func(ztAddress uint64, family int) *netip.AddrPort
+
+	// Logger receives internal warnings. Optional.
+	// If nil, internal warnings are dropped.
+	Logger func(msg string)
 }
 
 // --- CGo callback exports ---
@@ -75,11 +80,13 @@ func goStateGetCallback(uptr unsafe.Pointer, objType C.int, id0 C.uint64_t, id1 
 	if n.callbacks.StateGet == nil {
 		return -1
 	}
-	data, ok := n.callbacks.StateGet(StateObjectType(objType), [2]uint64{uint64(id0), uint64(id1)})
+	objTypeGo := StateObjectType(objType)
+	data, ok := n.callbacks.StateGet(objTypeGo, [2]uint64{uint64(id0), uint64(id1)})
 	if !ok || len(data) == 0 {
 		return -1
 	}
 	if uint(len(data)) > uint(bufLen) {
+		n.warn(fmt.Sprintf("zt: state object truncated in StateGet callback: type=%v id=%016x/%016x len=%d bufLen=%d", objTypeGo, uint64(id0), uint64(id1), len(data), bufLen))
 		return -1
 	}
 	C.memcpy(buf, unsafe.Pointer(&data[0]), C.size_t(len(data)))
@@ -186,4 +193,10 @@ func goPathLookupCallback(uptr unsafe.Pointer, ztAddress C.uint64_t, family C.in
 	}
 	addrPortToSockaddr(*ap, result)
 	return 1
+}
+
+func (n *Node) warn(msg string) {
+	if n.callbacks.Logger != nil {
+		n.callbacks.Logger(msg)
+	}
 }

@@ -49,6 +49,7 @@ func sockaddrToAddrPort(sa *C.struct_sockaddr_storage) (netip.AddrPort, bool) {
 // addrPortToSockaddr converts a Go netip.AddrPort to a C sockaddr_storage.
 func addrPortToSockaddr(ap netip.AddrPort, sa *C.struct_sockaddr_storage) {
 	C.memset(unsafe.Pointer(sa), 0, C.sizeof_struct_sockaddr_storage)
+	ap = normalizeAddrPort(ap)
 	addr := ap.Addr()
 	if addr.Is4() {
 		sin := (*C.struct_sockaddr_in)(unsafe.Pointer(sa))
@@ -83,7 +84,7 @@ func sockaddrToPrefix(sa *C.struct_sockaddr_storage) (netip.Prefix, bool) {
 		var portBytes [2]byte
 		copy(portBytes[:], (*[2]byte)(unsafe.Pointer(&sin.sin_port))[:])
 		bits := int(binary.BigEndian.Uint16(portBytes[:]))
-		return netip.PrefixFrom(netip.AddrFrom4(ip), bits), true
+		return prefixFromAddrBits(netip.AddrFrom4(ip), bits)
 	case C.AF_INET6:
 		sin6 := (*C.struct_sockaddr_in6)(unsafe.Pointer(sa))
 		var ip [16]byte
@@ -91,7 +92,7 @@ func sockaddrToPrefix(sa *C.struct_sockaddr_storage) (netip.Prefix, bool) {
 		var portBytes [2]byte
 		copy(portBytes[:], (*[2]byte)(unsafe.Pointer(&sin6.sin6_port))[:])
 		bits := int(binary.BigEndian.Uint16(portBytes[:]))
-		return netip.PrefixFrom(netip.AddrFrom16(ip), bits), true
+		return prefixFromAddrBits(netip.AddrFrom16(ip), bits)
 	default:
 		return netip.Prefix{}, false
 	}
@@ -99,10 +100,14 @@ func sockaddrToPrefix(sa *C.struct_sockaddr_storage) (netip.Prefix, bool) {
 
 // sockaddrToAddr extracts only the IP address from a sockaddr_storage.
 func sockaddrToAddr(sa *C.struct_sockaddr_storage) (netip.Addr, bool) {
-	if sa == nil || C.zt_ss_family(sa) == 0 {
+	if sa == nil {
 		return netip.Addr{}, false
 	}
-	switch C.zt_ss_family(sa) {
+	family := C.zt_ss_family(sa)
+	if family == 0 {
+		return netip.Addr{}, false
+	}
+	switch family {
 	case C.AF_INET:
 		sin := (*C.struct_sockaddr_in)(unsafe.Pointer(sa))
 		var ip [4]byte
@@ -116,6 +121,15 @@ func sockaddrToAddr(sa *C.struct_sockaddr_storage) (netip.Addr, bool) {
 	default:
 		return netip.Addr{}, false
 	}
+}
+
+func normalizeAddrPort(ap netip.AddrPort) netip.AddrPort {
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+}
+
+func prefixFromAddrBits(addr netip.Addr, bits int) (netip.Prefix, bool) {
+	p := netip.PrefixFrom(addr, bits)
+	return p, p.IsValid()
 }
 
 // convertNodeStatus converts a C ZT_NodeStatus to a Go NodeStatus.
