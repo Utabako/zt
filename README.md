@@ -6,14 +6,14 @@
 
 ## 工作原理
 
-ZeroTier 的核心逻辑是 C++ 实现的（`libzerotiercore.a`）。本库通过 CGo 调用这个静态库，对外暴露 Go 风格的 API。你需要先编译这个静态库，然后才能 `go build`。
+本仓库把运行 zt 所需的 ZeroTier One 上游源码子集 vendoring 到 `zerotier/` 目录中，由 CGo 直接参与编译，对外暴露 Go 风格的 API。普通使用场景下不需要单独准备子模块，也不需要预先生成静态库。
 
 ```
 你的 Go 代码
     ↓
 zt（本库）
     ↓  CGo
-libzerotiercore.a（ZeroTier C++ 核心）
+zerotier/（vendored 的 ZeroTier C++ 源码子集）
     ↓
 物理网络 / 虚拟网络
 ```
@@ -21,26 +21,18 @@ libzerotiercore.a（ZeroTier C++ 核心）
 ## 环境要求
 
 - Go 1.21+
-- g++ 或 clang++（编译 ZeroTier C++ 核心用）
-- git submodule（ZeroTier One 源码）
+- g++ 或 clang++（用于编译 vendored 的 ZeroTier C++ 源码）
 
 ## 快速开始
 
-### 第一步：拉取 ZeroTier 源码
-
 ```bash
-git submodule update --init --recursive
+go build ./...
+go test ./...
 ```
 
-### 第二步：编译静态库
+写代码时直接导入 `github.com/Utabako/zt` 即可。
 
-```bash
-make lib
-```
-
-编译产物在 `lib/libzerotiercore.a`，之后 `go build` 会自动链接它。
-
-### 第三步：写代码
+### 写代码
 
 一个最小可运行的例子——启动节点、加入网络、保持运行：
 
@@ -70,24 +62,8 @@ func main() {
     }
     defer conn.Close()
 
-    var node *zt.Node
 
-    // 后台 goroutine：把收到的 UDP 包喂给节点
-    go func() {
-        buf := make([]byte, 16384)
-        for {
-            n, addr, err := conn.ReadFrom(buf)
-            if err != nil {
-                return
-            }
-            if node != nil {
-                ap := addr.(*net.UDPAddr).AddrPort()
-                node.ProcessWirePacket(0, ap, buf[:n], nil)
-            }
-        }
-    }()
-
-    node, err = zt.NewNode(zt.NodeCallbacks{
+    node, err := zt.NewNode(zt.NodeCallbacks{
         // StatePut / StateGet：持久化节点身份和网络配置
         // 这里简单丢弃，生产代码里应该写到磁盘
         StatePut: func(t zt.StateObjectType, id [2]uint64, data []byte) {},
@@ -122,6 +98,19 @@ func main() {
         log.Fatal(err)
     }
     defer node.Close()
+
+    // 后台 goroutine：把收到的 UDP 包喂给已经创建好的节点
+    go func() {
+        buf := make([]byte, 16384)
+        for {
+            n, addr, err := conn.ReadFrom(buf)
+            if err != nil {
+                return
+            }
+            ap := addr.(*net.UDPAddr).AddrPort()
+            _ = node.ProcessWirePacket(0, ap, buf[:n], nil)
+        }
+    }()
 
     fmt.Printf("节点地址: %010x\n", node.Address())
 
@@ -165,6 +154,10 @@ func main() {
 | `VirtualNetworkConfig(nwid, op, config)` | 网络配置变更 | 根据 `op`（UP/CONFIG_UPDATE/DOWN/DESTROY）调整你这端的网络接口；成功返回 `0` |
 | `Event(event, data)` | 节点状态事件 | 处理上线/下线/错误等事件；`data` 的类型取决于 `event`（见下表） |
 
+缺少任意必填回调时，`NewNode` 会返回包含全部缺失字段的错误，并且不会创建节点。`StatePut` 中只有 `nil` 表示删除；非 nil 空切片表示一个存在的零长度对象，`StateGet` 应以 `[]byte{}, true` 返回它。
+
+回调由 ZeroTier C++ 核心同步触发。回调 panic 不会越过 CGo 边界；如果设置了 `Logger`，它会收到包含堆栈的诊断，有返回值的回调会按失败返回。除 `Address()` 外，不要在任何回调中调用 Node 方法；上游核心在触发回调时可能持有内部锁。
+
 **Event 的 data 类型**：
 
 | Event | data 类型 |
@@ -182,6 +175,8 @@ func main() {
 | `PathLookup(ztAddr, family)` | 提供对端的地址提示（类似地址簿） |
 | `Logger(msg)` | 接收库内部的诊断信息（如缓冲区溢出警告） |
 
+IPv6 link-local 地址会保留 scope。传入地址的 zone 可以是接口名或十进制接口索引；回调返回的 zone 使用十进制接口索引。
+
 ## API 速查
 
 ### 节点生命周期
@@ -192,7 +187,7 @@ node.Close()                                // 关闭节点，可安全调用多
 major, minor, rev := zt.Version()          // 查询 ZeroTier 核心版本
 ```
 
-> 注意：`Close()` 之后调用任何节点方法会 panic。
+> 注意：`Close()` 会等待在途调用完成，并在销毁前恰好发送一次 `EventDown`。处理 `EventDown` 时不得再调用 Node；`Close()` 返回后调用任何节点方法都会 panic。
 
 ### 网络
 
@@ -239,19 +234,14 @@ node.MulticastUnsubscribe(nwid, group, adi)  // 取消订阅
 
 ## 交叉编译
 
-```bash
-# Linux ARM64
-make linux-arm64
+本仓库不再提供基于 `make` 的交叉编译快捷目标。由于这里同时涉及 cgo 和 vendored 的 C++ 源码，交叉编译依赖目标平台对应的 C/C++ 工具链与 CGO 配置。
 
-# Android ARM64（需要 NDK）
-NDK=/path/to/ndk make android-arm64
-
-# 指定其他 ZeroTier 源码路径
-make lib ZEROTIER_SRC=/path/to/ZeroTierOne
-```
+如果你需要交叉编译，请显式设置目标平台的 `CC`、`CXX`、`CGO_ENABLED` 及相关环境变量，或直接在目标平台上原生构建。
 
 ## 许可证
 
-本仓库的 Go 绑定代码使用 **MIT** 协议。
+本仓库中的 Go 绑定代码使用 **MIT** 协议。
 
-`ZeroTierOne/` 子模块保留其原有上游协议，不受 MIT 协议约束。具体见 `ZeroTierOne/LICENSE.txt` 及 `ZeroTierOne/ext/` 下各自的许可文件。
+`zerotier/` 目录下 vendored 的 ZeroTier One 上游源码及其包含的第三方代码继续适用各自原始许可证，不受 MIT 协议重新授权。具体见 `zerotier/LICENSE.txt` 及其子目录中的许可证文件。
+
+`nonfree/` 未被引入本仓库。

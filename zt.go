@@ -5,8 +5,17 @@
 package zt
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/ZeroTierOne/include
-#cgo LDFLAGS: -L${SRCDIR}/lib -lzerotiercore -lstdc++ -lm
+#cgo CFLAGS: -I${SRCDIR}/zerotier/include
+#cgo CXXFLAGS: -I${SRCDIR}/zerotier/include
+#cgo CXXFLAGS: -I${SRCDIR}/zerotier
+#cgo CXXFLAGS: -I${SRCDIR}/zerotier/ext
+#cgo CXXFLAGS: -I${SRCDIR}/zerotier/ext/prometheus-cpp-lite-1.0/core/include
+#cgo CXXFLAGS: -I${SRCDIR}/zerotier/ext/prometheus-cpp-lite-1.0/3rdparty/http-client-lite/include
+#cgo CXXFLAGS: -I${SRCDIR}/zerotier/ext/prometheus-cpp-lite-1.0/simpleapi/include
+#cgo CXXFLAGS: -std=c++17
+#cgo CXXFLAGS: -include stdexcept
+#cgo CXXFLAGS: -DZT_USE_MINIUPNPC=0
+#cgo LDFLAGS: -lstdc++ -lm
 #cgo !android LDFLAGS: -lpthread
 #cgo android LDFLAGS: -llog
 #include <stdbool.h>

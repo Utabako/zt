@@ -1,0 +1,84 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: "1"
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Race test
+        if: runner.os == 'Linux'
+        run: go test -race ./...
+
+      - name: Checkptr test
+        if: runner.os == 'Linux'
+        run: go test -gcflags=all=-d=checkptr=2 ./...
+
+      - name: Consumer smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+
+          cat >"$tmp_dir/go.mod" <<EOF
+          module example.com/zt-consumer-smoke
+
+          go 1.21
+
+          require github.com/Utabako/zt v0.0.0
+
+          replace github.com/Utabako/zt => ${GITHUB_WORKSPACE}
+          EOF
+
+          cat >"$tmp_dir/main.go" <<'EOF'
+          package main
+
+          import "github.com/Utabako/zt"
+
+          var _ zt.NodeConfig
+
+          func main() {}
+          EOF
+
+          (
+            cd "$tmp_dir"
+            go build ./...
+          )

@@ -1,5 +1,1 @@
-.gitignore: build/
-lib/
-*.a
-*.o
 zt-example

@@ -5,10 +5,25 @@ import (
 	"testing"
 )
 
+func testNodeCallbacks() NodeCallbacks {
+	return NodeCallbacks{
+		StatePut: func(StateObjectType, [2]uint64, []byte) {},
+		StateGet: func(StateObjectType, [2]uint64) ([]byte, bool) {
+			return nil, false
+		},
+		WirePacketSend: func(int64, netip.AddrPort, []byte, uint) error {
+			return nil
+		},
+		VirtualNetworkFrame:  func(uint64, uint64, uint64, uint, uint, []byte) {},
+		VirtualNetworkConfig: func(uint64, VirtualNetworkConfigOperation, *VirtualNetworkConfig) int { return 0 },
+		Event:                func(Event, any) {},
+	}
+}
+
 func newTestNode(t *testing.T) *Node {
 	t.Helper()
 
-	node, err := NewNode(NodeCallbacks{}, nil)
+	node, err := NewNode(testNodeCallbacks(), nil)
 	if err != nil {
 		t.Fatalf("NewNode() error = %v", err)
 	}
@@ -70,21 +85,21 @@ func TestBoolResultToError(t *testing.T) {
 	}
 }
 
-func TestMustCNodePanicsAfterClose(t *testing.T) {
+func TestNodeMethodPanicsAfterClose(t *testing.T) {
 	node := newTestNode(t)
 	node.Close()
 
 	defer func() {
 		r := recover()
 		if r == nil {
-			t.Fatal("mustCNode() did not panic after Close()")
+			t.Fatal("Address() did not panic after Close()")
 		}
 		if got, want := r, "zt: use of closed Node"; got != want {
 			t.Fatalf("panic = %v, want %q", got, want)
 		}
 	}()
 
-	_ = node.mustCNode()
+	_ = node.Address()
 }
 
 func TestWarnUsesOptionalLogger(t *testing.T) {

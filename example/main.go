@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/Utabako/zt"
@@ -55,30 +54,7 @@ func main() {
 	defer udpConn.Close()
 	fmt.Printf("Listening on %s\n", udpConn.LocalAddr())
 
-	var node *zt.Node
-	var nodeMu sync.Mutex
-
-	go func() {
-		buf := make([]byte, 16384)
-		for {
-			n, addr, err := udpConn.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			udpAddr, ok := addr.(*net.UDPAddr)
-			if !ok {
-				continue
-			}
-			ap := netip.AddrPortFrom(udpAddr.AddrPort().Addr(), udpAddr.AddrPort().Port())
-			nodeMu.Lock()
-			if node != nil {
-				node.ProcessWirePacket(0, ap, buf[:n], nil)
-			}
-			nodeMu.Unlock()
-		}
-	}()
-
-	node, err = zt.NewNode(zt.NodeCallbacks{
+	node, err := zt.NewNode(zt.NodeCallbacks{
 		StatePut: store.Put,
 		StateGet: store.Get,
 		WirePacketSend: func(localSocket int64, addr netip.AddrPort, data []byte, ttl uint) error {
@@ -120,6 +96,22 @@ func main() {
 	}
 	defer node.Close()
 
+	go func() {
+		buf := make([]byte, 16384)
+		for {
+			n, addr, err := udpConn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			udpAddr, ok := addr.(*net.UDPAddr)
+			if !ok {
+				continue
+			}
+			ap := udpAddr.AddrPort()
+			_ = node.ProcessWirePacket(0, ap, buf[:n], nil)
+		}
+	}()
+
 	fmt.Printf("Node address: %010x\n", node.Address())
 
 	networkID := uint64(0x8056c2e21c000001)
@@ -150,9 +142,7 @@ func main() {
 			node.Leave(networkID)
 			return
 		case <-ticker.C:
-			nodeMu.Lock()
 			node.ProcessBackgroundTasks(nil)
-			nodeMu.Unlock()
 		case <-statusTicker.C:
 			status := node.Status()
 			fmt.Printf("  Status: online=%v address=%010x\n", status.Online, status.Address)

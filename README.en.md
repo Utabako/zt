@@ -6,14 +6,14 @@ Go bindings for the [ZeroTier One](https://github.com/zerotier/ZeroTierOne) C co
 
 ## How it works
 
-ZeroTier's core logic is implemented in C++ (`libzerotiercore.a`). This library wraps that static library via CGo and exposes a Go-idiomatic API. You need to build the static library once before running `go build`.
+This repository vendors the required subset of upstream ZeroTier One sources under `zerotier/` and lets CGo compile them directly, exposing a Go-idiomatic API. For normal use you do not need to initialize a submodule or build a separate static library first.
 
 ```
 Your Go code
     ↓
 zt (this library)
     ↓  CGo
-libzerotiercore.a (ZeroTier C++ core)
+zerotier/ (vendored subset of ZeroTier C++ sources)
     ↓
 Physical network / virtual network
 ```
@@ -21,26 +21,18 @@ Physical network / virtual network
 ## Requirements
 
 - Go 1.21+
-- g++ or clang++
-- git submodule (ZeroTier One source)
+- g++ or clang++ (to compile the vendored ZeroTier C++ sources)
 
 ## Quick Start
 
-### 1. Initialize the submodule
-
 ```bash
-git submodule update --init --recursive
+go build ./...
+go test ./...
 ```
 
-### 2. Build the static library
+Import `github.com/Utabako/zt` and start coding.
 
-```bash
-make lib
-```
-
-The output is `lib/libzerotiercore.a`. `go build` links it automatically.
-
-### 3. Write your code
+### Write your code
 
 A minimal example — start a node, join a network, keep it running:
 
@@ -70,24 +62,8 @@ func main() {
     }
     defer conn.Close()
 
-    var node *zt.Node
 
-    // Background goroutine: feed incoming UDP packets to the node
-    go func() {
-        buf := make([]byte, 16384)
-        for {
-            n, addr, err := conn.ReadFrom(buf)
-            if err != nil {
-                return
-            }
-            if node != nil {
-                ap := addr.(*net.UDPAddr).AddrPort()
-                node.ProcessWirePacket(0, ap, buf[:n], nil)
-            }
-        }
-    }()
-
-    node, err = zt.NewNode(zt.NodeCallbacks{
+    node, err := zt.NewNode(zt.NodeCallbacks{
         // StatePut / StateGet: persist node identity and network configs
         // (discard here; production code should write to disk)
         StatePut: func(t zt.StateObjectType, id [2]uint64, data []byte) {},
@@ -122,6 +98,19 @@ func main() {
         log.Fatal(err)
     }
     defer node.Close()
+
+    // Background goroutine: feed incoming UDP packets to the initialized node
+    go func() {
+        buf := make([]byte, 16384)
+        for {
+            n, addr, err := conn.ReadFrom(buf)
+            if err != nil {
+                return
+            }
+            ap := addr.(*net.UDPAddr).AddrPort()
+            _ = node.ProcessWirePacket(0, ap, buf[:n], nil)
+        }
+    }()
 
     fmt.Printf("node address: %010x\n", node.Address())
 
@@ -165,6 +154,10 @@ See [`example/main.go`](example/main.go) for a complete example.
 | `VirtualNetworkConfig(nwid, op, config)` | Network configuration changed | React to `op` (UP / CONFIG_UPDATE / DOWN / DESTROY); return `0` on success |
 | `Event(event, data)` | Node state event | Handle online/offline/error events; `data` type depends on `event` (see below) |
 
+If any required callback is missing, `NewNode` returns an error listing every missing field and does not create a node. Only `nil` passed to `StatePut` means deletion; a non-nil empty slice is a present zero-length object and should be returned by `StateGet` as `[]byte{}, true`.
+
+Callbacks run synchronously from the ZeroTier C++ core. A callback panic cannot cross the CGo boundary; when `Logger` is configured it receives a diagnostic with the stack, and callbacks with return values fail closed. Do not call Node methods from callbacks except `Address()` because the upstream core may hold internal locks while invoking them.
+
 **Event `data` types:**
 
 | Event | `data` type |
@@ -182,6 +175,8 @@ See [`example/main.go`](example/main.go) for a complete example.
 | `PathLookup(ztAddr, family)` | Provide address hints for reaching a peer (like an address book) |
 | `Logger(msg)` | Receive internal diagnostic messages (e.g. buffer overflow warnings) |
 
+IPv6 link-local addresses retain their scope. Input zones may be interface names or decimal interface indexes; callbacks expose zones as decimal interface indexes.
+
 ## API Reference
 
 ### Node lifecycle
@@ -192,7 +187,7 @@ node.Close()                                // shut down; safe to call multiple 
 major, minor, rev := zt.Version()          // ZeroTier core version
 ```
 
-> Calling any method after `Close()` will panic.
+> `Close()` waits for in-flight calls and emits exactly one `EventDown` before destruction. Do not call Node methods while handling `EventDown`; calling any Node method after `Close()` returns will panic.
 
 ### Networks
 
@@ -239,19 +234,14 @@ node.MulticastUnsubscribe(nwid, group, adi)  // unsubscribe
 
 ## Cross-compilation
 
-```bash
-# Linux ARM64
-make linux-arm64
+This repository no longer ships `make` shortcuts for cross-compilation. Because the build now involves both cgo and vendored C++ sources, cross-compiling depends on having the target platform's C/C++ toolchain and CGO configuration available.
 
-# Android ARM64 (requires NDK)
-NDK=/path/to/ndk make android-arm64
-
-# Custom ZeroTier source path
-make lib ZEROTIER_SRC=/path/to/ZeroTierOne
-```
+If you need cross-compilation, set the target `CC`, `CXX`, `CGO_ENABLED`, and related environment variables explicitly, or build natively on the target platform.
 
 ## License
 
-The Go binding code in this repository is licensed under the **MIT** license.
+The Go binding code in this repository remains licensed under the **MIT** license.
 
-The `ZeroTierOne/` git submodule retains its original upstream licenses and is not relicensed under MIT. See `ZeroTierOne/LICENSE.txt` and the license files under `ZeroTierOne/ext/` for details.
+The upstream ZeroTier One sources vendored under `zerotier/`, together with any third-party code they contain, keep their original licenses and are not relicensed under MIT. See `zerotier/LICENSE.txt` and the license files in its subdirectories for details.
+
+`nonfree/` is not included in this repository.

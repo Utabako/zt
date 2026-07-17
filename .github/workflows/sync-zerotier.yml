@@ -1,0 +1,336 @@
+name: sync-zerotier
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: https://github.com/zerotier/ZeroTierOne.git
+  UPSTREAM_BRANCH: "1.16.1"
+  SYNC_BRANCH: automation/sync-zerotier
+  TARGET_DIR: zerotier
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.ZT_SYNC_APP_ID }}
+          private-key: ${{ secrets.ZT_SYNC_APP_PRIVATE_KEY }}
+
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up git identity
+        run: |
+          git config user.name "zt sync bot"
+          git config user.email "zt-sync[bot]@users.noreply.github.com"
+
+      - name: Sync vendored ZeroTier tree
+        id: sync-tree
+        shell: bash
+        env:
+          REPO_ROOT: ${{ github.workspace }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin "$DEFAULT_BRANCH"
+          git checkout -B "$SYNC_BRANCH" "origin/$DEFAULT_BRANCH"
+
+          upstream_dir="$(mktemp -d)"
+          trap 'rm -rf "$upstream_dir"' EXIT
+          git clone --depth 1 --branch "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" "$upstream_dir"
+
+          UPSTREAM_DIR="$upstream_dir" python3 - <<'PY'
+          import json
+          import shutil
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+          import os
+
+          repo_root = Path(os.environ["REPO_ROOT"])
+          upstream_root = Path(os.environ["UPSTREAM_DIR"])
+          target_root = repo_root / os.environ["TARGET_DIR"]
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          branch = os.environ["UPSTREAM_BRANCH"]
+
+          def emit(name: str, value: str) -> None:
+              with output_path.open("a", encoding="utf-8") as fh:
+                  fh.write(f"{name}={value}\n")
+
+          old_meta_path = target_root / "UPSTREAM.json"
+          old_meta = {}
+          if old_meta_path.exists():
+              old_meta = json.loads(old_meta_path.read_text(encoding="utf-8"))
+          old_commit = old_meta.get("commit", "")
+
+          new_commit = subprocess.check_output(
+              ["git", "-C", str(upstream_root), "rev-parse", "HEAD"],
+              text=True,
+          ).strip()
+          compare_url = (
+              f"https://github.com/zerotier/ZeroTierOne/compare/{old_commit}...{new_commit}"
+              if old_commit
+              else f"https://github.com/zerotier/ZeroTierOne/commit/{new_commit}"
+          )
+          emit("old_commit", old_commit)
+          emit("new_commit", new_commit)
+          emit("compare_url", compare_url)
+          emit("tracked_branch", branch)
+
+          if old_commit == new_commit:
+              raise SystemExit(0)
+
+          node_sources = sorted((upstream_root / "node").glob("*.cpp"))
+          osutils = upstream_root / "osdep" / "OSUtils.cpp"
+          dep_cmd = [
+              "g++",
+              "-O2",
+              "-fPIC",
+              "-std=c++17",
+              "-Wall",
+              f"-I{upstream_root / 'include'}",
+              f"-I{upstream_root}",
+              f"-I{upstream_root / 'ext'}",
+              f"-I{upstream_root / 'ext' / 'prometheus-cpp-lite-1.0' / 'core' / 'include'}",
+              f"-I{upstream_root / 'ext' / 'prometheus-cpp-lite-1.0' / '3rdparty' / 'http-client-lite' / 'include'}",
+              f"-I{upstream_root / 'ext' / 'prometheus-cpp-lite-1.0' / 'simpleapi' / 'include'}",
+              "-include",
+              "stdexcept",
+              "-DZT_USE_MINIUPNPC=0",
+              "-M",
+              *(str(path) for path in node_sources),
+              str(osutils),
+          ]
+          dep_result = subprocess.run(dep_cmd, check=True, capture_output=True, text=True)
+          dep_text = dep_result.stdout.replace("\\\n", " ")
+          dep_tokens = dep_text.split(":", 1)[1].split()
+
+          approved_prefixes = ("include/", "node/", "osdep/", "ext/")
+          closure = []
+          seen = set()
+          upstream_real = upstream_root.resolve()
+          for token in dep_tokens:
+              path = Path(token).resolve()
+              try:
+                  rel = path.relative_to(upstream_real).as_posix()
+              except ValueError:
+                  continue
+              if rel in seen:
+                  continue
+              seen.add(rel)
+              if rel.startswith("nonfree/"):
+                  raise SystemExit(f"refusing to vendor forbidden path: {rel}")
+              if rel != "version.h" and not rel.startswith(approved_prefixes):
+                  raise SystemExit(f"unapproved dependency path: {rel}")
+              closure.append(rel)
+
+          if target_root.exists():
+              shutil.rmtree(target_root)
+          target_root.mkdir(parents=True, exist_ok=True)
+          (target_root / "LICENSES").mkdir(parents=True, exist_ok=True)
+
+          shutil.copytree(upstream_root / "include", target_root / "include", dirs_exist_ok=True)
+          shutil.copytree(upstream_root / "node", target_root / "node", dirs_exist_ok=True)
+
+          copied_files = {"LICENSE.txt", "LICENSE-MPL.txt", "version.h"}
+          shutil.copy2(upstream_root / "version.h", target_root / "version.h")
+          shutil.copy2(upstream_root / "LICENSE.txt", target_root / "LICENSE.txt")
+          shutil.copy2(upstream_root / "LICENSE-MPL.txt", target_root / "LICENSE-MPL.txt")
+
+          for rel in closure:
+              copied_files.add(rel)
+              if rel.startswith("include/") or rel.startswith("node/") or rel == "version.h":
+                  continue
+              destination = target_root / rel
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(upstream_root / rel, destination)
+
+          license_map = {
+              upstream_root / "ext" / "nlohmann" / "LICENSE.MIT": target_root / "LICENSES" / "nlohmann-LICENSE.MIT",
+              upstream_root / "ext" / "prometheus-cpp-lite-1.0" / "LICENSE": target_root / "LICENSES" / "prometheus-cpp-lite-LICENSE",
+              upstream_root / "ext" / "prometheus-cpp-lite-1.0" / "3rdparty" / "http-client-lite" / "LICENSE": target_root / "LICENSES" / "http-client-lite-LICENSE",
+          }
+          for src, dst in license_map.items():
+              shutil.copy2(src, dst)
+
+          for wrapper in repo_root.glob("zt_upstream_*.cpp"):
+              wrapper.unlink()
+
+          generated_wrappers = []
+          for source in sorted((target_root / "node").glob("*.cpp")):
+              wrapper_name = f"zt_upstream_node_{source.stem}.cpp"
+              (repo_root / wrapper_name).write_text(
+                  "// Code generated by .github/workflows/sync-zerotier.yml; DO NOT EDIT.\n"
+                  f'#include "zerotier/node/{source.name}"\n',
+                  encoding="utf-8",
+              )
+              generated_wrappers.append(wrapper_name)
+
+          osutils_wrapper = "zt_upstream_osdep_OSUtils.cpp"
+          (repo_root / osutils_wrapper).write_text(
+              "// Code generated by .github/workflows/sync-zerotier.yml; DO NOT EDIT.\n"
+              '#include "zerotier/osdep/OSUtils.cpp"\n',
+              encoding="utf-8",
+          )
+          generated_wrappers.append(osutils_wrapper)
+
+          metadata = {
+              "repository": os.environ["UPSTREAM_REPO"],
+              "branch": branch,
+              "commit": new_commit,
+              "syncedAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+              "copiedFiles": sorted(copied_files),
+              "generatedWrappers": generated_wrappers,
+              "licenseFiles": [
+                  "LICENSE.txt",
+                  "LICENSE-MPL.txt",
+                  "LICENSES/nlohmann-LICENSE.MIT",
+                  "LICENSES/prometheus-cpp-lite-LICENSE",
+                  "LICENSES/http-client-lite-LICENSE",
+              ],
+              "compareURL": compare_url,
+          }
+          (target_root / "UPSTREAM.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+          PY
+
+      - name: Inspect diff
+        id: diff
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add -A .
+
+          if git diff --cached --quiet --exit-code; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "ext_changed=false" >> "$GITHUB_OUTPUT"
+            echo "license_changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git diff --cached --quiet --exit-code; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "ext_changed=false" >> "$GITHUB_OUTPUT"
+            echo "license_changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mapfile -t changed_files < <(git diff --cached --name-only)
+          printf '%s\n' "${changed_files[@]}"
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          if printf '%s\n' "${changed_files[@]}" | grep -q '^zerotier/ext/'; then
+            echo "ext_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ext_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if printf '%s\n' "${changed_files[@]}" | grep -Eq '^zerotier/(LICENSE|LICENSES/)'; then
+            echo "license_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "license_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit changes
+        if: steps.diff.outputs.changed == 'true'
+        shell: bash
+        env:
+          NEW_COMMIT: ${{ steps.sync-tree.outputs.new_commit }}
+        run: |
+          set -euo pipefail
+          git commit -m "⬆️ vendor ZeroTierOne ${UPSTREAM_BRANCH} @ ${NEW_COMMIT:0:12}"
+
+      - name: Push sync branch
+        if: steps.diff.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO_SLUG}.git"
+          git push --force-with-lease origin "$SYNC_BRANCH"
+
+      - name: Create or update pull request
+        if: steps.diff.outputs.changed == 'true'
+        id: pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          OLD_COMMIT: ${{ steps.sync-tree.outputs.old_commit }}
+          NEW_COMMIT: ${{ steps.sync-tree.outputs.new_commit }}
+          COMPARE_URL: ${{ steps.sync-tree.outputs.compare_url }}
+          TRACKED_BRANCH: ${{ steps.sync-tree.outputs.tracked_branch }}
+          EXT_CHANGED: ${{ steps.diff.outputs.ext_changed }}
+          LICENSE_CHANGED: ${{ steps.diff.outputs.license_changed }}
+        run: |
+          set -euo pipefail
+
+          body_file="$(mktemp)"
+          trap 'rm -f "$body_file"' EXIT
+
+          {
+            echo "## Summary"
+            if [ -n "$OLD_COMMIT" ]; then
+              echo "- old commit: $OLD_COMMIT"
+            else
+              echo "- old commit: (none)"
+            fi
+            echo "- new commit: $NEW_COMMIT"
+            echo "- tracked branch: $TRACKED_BRANCH"
+            echo "- compare: $COMPARE_URL"
+            echo
+            echo "## Notes"
+            if [ "$EXT_CHANGED" = "true" ]; then
+              echo "- ext/** changed in the vendored closure."
+            else
+              echo "- ext/** unchanged."
+            fi
+            if [ "$LICENSE_CHANGED" = "true" ]; then
+              echo "- License payload changed. Review copied license files before merge."
+            else
+              echo "- License payload unchanged."
+            fi
+          } > "$body_file"
+
+          pr_number="$(gh pr list --head "$SYNC_BRANCH" --base "$BASE_BRANCH" --json number --jq '.[0].number // empty')"
+          title="⬆️ sync ZeroTierOne ${TRACKED_BRANCH} to ${NEW_COMMIT:0:12}"
+
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" --title "$title" --body-file "$body_file"
+          else
+            pr_number="$(gh pr create --base "$BASE_BRANCH" --head "$SYNC_BRANCH" --title "$title" --body-file "$body_file")"
+            pr_number="${pr_number##*/}"
+          fi
+
+          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+
+      - name: Enable auto-merge
+        if: steps.pr.outputs.number != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          gh pr merge "${{ steps.pr.outputs.number }}" --auto --squash

@@ -15,7 +15,10 @@ import "C"
 
 import (
 	"encoding/binary"
+	"fmt"
+	"net"
 	"net/netip"
+	"strconv"
 	"unsafe"
 )
 
@@ -40,34 +43,73 @@ func sockaddrToAddrPort(sa *C.struct_sockaddr_storage) (netip.AddrPort, bool) {
 		var portBytes [2]byte
 		copy(portBytes[:], (*[2]byte)(unsafe.Pointer(&sin6.sin6_port))[:])
 		port := binary.BigEndian.Uint16(portBytes[:])
-		return netip.AddrPortFrom(netip.AddrFrom16(ip), port), true
+		addr := netip.AddrFrom16(ip)
+		if zone := zoneForScopeID(uint32(sin6.sin6_scope_id)); zone != "" {
+			addr = addr.WithZone(zone)
+		}
+		return netip.AddrPortFrom(addr, port), true
 	default:
 		return netip.AddrPort{}, false
 	}
 }
 
 // addrPortToSockaddr converts a Go netip.AddrPort to a C sockaddr_storage.
-func addrPortToSockaddr(ap netip.AddrPort, sa *C.struct_sockaddr_storage) {
-	C.memset(unsafe.Pointer(sa), 0, C.sizeof_struct_sockaddr_storage)
+func addrPortToSockaddr(ap netip.AddrPort) (sa C.struct_sockaddr_storage, err error) {
+	if !ap.IsValid() {
+		return sa, fmt.Errorf("zt: invalid address %v", ap)
+	}
+
+	C.memset(unsafe.Pointer(&sa), 0, C.sizeof_struct_sockaddr_storage)
 	ap = normalizeAddrPort(ap)
 	addr := ap.Addr()
 	if addr.Is4() {
-		sin := (*C.struct_sockaddr_in)(unsafe.Pointer(sa))
+		sin := (*C.struct_sockaddr_in)(unsafe.Pointer(&sa))
 		sin.sin_family = C.AF_INET
 		ip4 := addr.As4()
 		copy((*[4]byte)(unsafe.Pointer(&sin.sin_addr))[:], ip4[:])
 		var portBytes [2]byte
 		binary.BigEndian.PutUint16(portBytes[:], ap.Port())
 		copy((*[2]byte)(unsafe.Pointer(&sin.sin_port))[:], portBytes[:])
-	} else {
-		sin6 := (*C.struct_sockaddr_in6)(unsafe.Pointer(sa))
-		sin6.sin6_family = C.AF_INET6
-		ip6 := addr.As16()
-		copy((*[16]byte)(unsafe.Pointer(&sin6.sin6_addr))[:], ip6[:])
-		var portBytes [2]byte
-		binary.BigEndian.PutUint16(portBytes[:], ap.Port())
-		copy((*[2]byte)(unsafe.Pointer(&sin6.sin6_port))[:], portBytes[:])
+		return sa, nil
 	}
+
+	scopeID, err := scopeIDForZone(addr.Zone())
+	if err != nil {
+		return sa, err
+	}
+	sin6 := (*C.struct_sockaddr_in6)(unsafe.Pointer(&sa))
+	sin6.sin6_family = C.AF_INET6
+	sin6.sin6_scope_id = C.uint32_t(scopeID)
+	ip6 := addr.WithZone("").As16()
+	copy((*[16]byte)(unsafe.Pointer(&sin6.sin6_addr))[:], ip6[:])
+	var portBytes [2]byte
+	binary.BigEndian.PutUint16(portBytes[:], ap.Port())
+	copy((*[2]byte)(unsafe.Pointer(&sin6.sin6_port))[:], portBytes[:])
+	return sa, nil
+}
+
+func scopeIDForZone(zone string) (uint32, error) {
+	if zone == "" {
+		return 0, nil
+	}
+	if scopeID, err := strconv.ParseUint(zone, 10, 32); err == nil {
+		return uint32(scopeID), nil
+	}
+	iface, err := net.InterfaceByName(zone)
+	if err != nil {
+		return 0, fmt.Errorf("zt: resolve IPv6 zone %q: %w", zone, err)
+	}
+	if iface.Index <= 0 {
+		return 0, fmt.Errorf("zt: IPv6 zone %q has invalid interface index %d", zone, iface.Index)
+	}
+	return uint32(iface.Index), nil
+}
+
+func zoneForScopeID(scopeID uint32) string {
+	if scopeID == 0 {
+		return ""
+	}
+	return strconv.FormatUint(uint64(scopeID), 10)
 }
 
 // sockaddrToPrefix converts a C sockaddr_storage to a Go netip.Prefix.
