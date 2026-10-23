@@ -14,7 +14,7 @@ concurrency:
 
 env:
   UPSTREAM_REPO: https://github.com/zerotier/ZeroTierOne.git
-  UPSTREAM_BRANCH: "1.16.1"
+  UPSTREAM_TAG: "1.16.2"
   SYNC_BRANCH: automation/sync-zerotier
   TARGET_DIR: zerotier
 
@@ -56,7 +56,9 @@ jobs:
 
           upstream_dir="$(mktemp -d)"
           trap 'rm -rf "$upstream_dir"' EXIT
-          git clone --depth 1 --branch "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" "$upstream_dir"
+          git init --quiet "$upstream_dir"
+          git -C "$upstream_dir" fetch --depth 1 "$UPSTREAM_REPO" "refs/tags/$UPSTREAM_TAG"
+          git -C "$upstream_dir" checkout --quiet --detach FETCH_HEAD
 
           UPSTREAM_DIR="$upstream_dir" python3 - <<'PY'
           import json
@@ -70,7 +72,7 @@ jobs:
           upstream_root = Path(os.environ["UPSTREAM_DIR"])
           target_root = repo_root / os.environ["TARGET_DIR"]
           output_path = Path(os.environ["GITHUB_OUTPUT"])
-          branch = os.environ["UPSTREAM_BRANCH"]
+          tag = os.environ["UPSTREAM_TAG"]
 
           def emit(name: str, value: str) -> None:
               with output_path.open("a", encoding="utf-8") as fh:
@@ -94,7 +96,7 @@ jobs:
           emit("old_commit", old_commit)
           emit("new_commit", new_commit)
           emit("compare_url", compare_url)
-          emit("tracked_branch", branch)
+          emit("tracked_tag", tag)
 
           if old_commit == new_commit:
               raise SystemExit(0)
@@ -195,7 +197,7 @@ jobs:
 
           metadata = {
               "repository": os.environ["UPSTREAM_REPO"],
-              "branch": branch,
+              "tag": tag,
               "commit": new_commit,
               "syncedAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
               "copiedFiles": sorted(copied_files),
@@ -228,13 +230,6 @@ jobs:
             exit 0
           fi
 
-          if git diff --cached --quiet --exit-code; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "ext_changed=false" >> "$GITHUB_OUTPUT"
-            echo "license_changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           mapfile -t changed_files < <(git diff --cached --name-only)
           printf '%s\n' "${changed_files[@]}"
 
@@ -258,7 +253,7 @@ jobs:
           NEW_COMMIT: ${{ steps.sync-tree.outputs.new_commit }}
         run: |
           set -euo pipefail
-          git commit -m "⬆️ vendor ZeroTierOne ${UPSTREAM_BRANCH} @ ${NEW_COMMIT:0:12}"
+          git commit -m "⬆️ vendor ZeroTierOne ${UPSTREAM_TAG} @ ${NEW_COMMIT:0:12}"
 
       - name: Push sync branch
         if: steps.diff.outputs.changed == 'true'
@@ -281,7 +276,7 @@ jobs:
           OLD_COMMIT: ${{ steps.sync-tree.outputs.old_commit }}
           NEW_COMMIT: ${{ steps.sync-tree.outputs.new_commit }}
           COMPARE_URL: ${{ steps.sync-tree.outputs.compare_url }}
-          TRACKED_BRANCH: ${{ steps.sync-tree.outputs.tracked_branch }}
+          TRACKED_TAG: ${{ steps.sync-tree.outputs.tracked_tag }}
           EXT_CHANGED: ${{ steps.diff.outputs.ext_changed }}
           LICENSE_CHANGED: ${{ steps.diff.outputs.license_changed }}
         run: |
@@ -298,7 +293,7 @@ jobs:
               echo "- old commit: (none)"
             fi
             echo "- new commit: $NEW_COMMIT"
-            echo "- tracked branch: $TRACKED_BRANCH"
+            echo "- tracked tag: $TRACKED_TAG"
             echo "- compare: $COMPARE_URL"
             echo
             echo "## Notes"
@@ -315,7 +310,7 @@ jobs:
           } > "$body_file"
 
           pr_number="$(gh pr list --head "$SYNC_BRANCH" --base "$BASE_BRANCH" --json number --jq '.[0].number // empty')"
-          title="⬆️ sync ZeroTierOne ${TRACKED_BRANCH} to ${NEW_COMMIT:0:12}"
+          title="⬆️ sync ZeroTierOne ${TRACKED_TAG} to ${NEW_COMMIT:0:12}"
 
           if [ -n "$pr_number" ]; then
             gh pr edit "$pr_number" --title "$title" --body-file "$body_file"

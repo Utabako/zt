@@ -17,8 +17,8 @@ import (
 )
 
 // NodeCallbacks defines all callback functions for a ZeroTier node.
-// NewNode rejects a missing required callback. Callbacks run synchronously from
-// the ZeroTier core; except for Node.Address, they must not call Node methods.
+// NewNode rejects a missing required callback. The core may invoke callbacks on
+// background threads; except for Node.Address, they must not call Node methods.
 // Panics are contained at the CGo boundary and reported through Logger when set.
 type NodeCallbacks struct {
 	// StatePut stores or deletes a state object.

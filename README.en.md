@@ -156,7 +156,7 @@ See [`example/main.go`](example/main.go) for a complete example.
 
 If any required callback is missing, `NewNode` returns an error listing every missing field and does not create a node. Only `nil` passed to `StatePut` means deletion; a non-nil empty slice is a present zero-length object and should be returned by `StateGet` as `[]byte{}, true`.
 
-Callbacks run synchronously from the ZeroTier C++ core. A callback panic cannot cross the CGo boundary; when `Logger` is configured it receives a diagnostic with the stack, and callbacks with return values fail closed. Do not call Node methods from callbacks except `Address()` because the upstream core may hold internal locks while invoking them.
+The ZeroTier C++ core invokes callbacks, and some frame callbacks run on background threads. A callback panic cannot cross the CGo boundary; when `Logger` is configured it receives a diagnostic with the stack, and callbacks with return values fail closed. Do not call Node methods from callbacks except `Address()` because the upstream core may hold internal locks while invoking them.
 
 **Event `data` types:**
 
@@ -188,6 +188,8 @@ major, minor, rev := zt.Version()          // ZeroTier core version
 ```
 
 > `Close()` waits for in-flight calls and emits exactly one `EventDown` before destruction. Do not call Node methods while handling `EventDown`; calling any Node method after `Close()` returns will panic.
+
+> Known upstream issue: ZeroTier 1.16.2 runs some frame callbacks on detached threads. `Close()` does not wait for those threads, so node destruction can race with callbacks. This lifecycle defect remains unresolved.
 
 ### Networks
 
