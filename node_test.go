@@ -1,7 +1,10 @@
 package zt
 
 import (
+	"fmt"
 	"net/netip"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -28,6 +31,60 @@ func newTestNode(t *testing.T) *Node {
 		t.Fatalf("NewNode() error = %v", err)
 	}
 	return node
+}
+
+func TestNetworkConfigPreservesNullTargetRoute(t *testing.T) {
+	const nwid = uint64(0x8056c2e21c000001)
+	// Serialized routes: 192.0.2.0/24 on-link, then a null target via
+	// 192.0.2.1 with metric 7. The dictionary escapes each NUL as \0.
+	const routes = "\x04\xc0\x00\x02\x00\x00\x18\x00\x00\x00\x00\x00" +
+		"\x00\x04\xc0\x00\x02\x01\x00\x00\x00\x00\x00\x07"
+	var address uint64
+	var callbackConfig *VirtualNetworkConfig
+	callbacks := testNodeCallbacks()
+	callbacks.StateGet = func(kind StateObjectType, id [2]uint64) ([]byte, bool) {
+		if kind != StateObjectNetworkConfig {
+			return nil, false
+		}
+		config := fmt.Sprintf("v=6\nnwid=%016x\nid=%010x\nRT=%s\n",
+			id[0], address, strings.ReplaceAll(routes, "\x00", "\\0"))
+		return []byte(config), true
+	}
+	callbacks.VirtualNetworkConfig = func(_ uint64, _ VirtualNetworkConfigOperation, config *VirtualNetworkConfig) int {
+		callbackConfig = config
+		return 0
+	}
+	node, err := NewNode(callbacks, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(node.Close)
+	address = node.Address()
+	if err := node.Join(nwid); err != nil {
+		t.Fatal(err)
+	}
+	networks := node.Networks()
+	if len(networks) != 1 {
+		t.Fatalf("Networks() returned %d networks, want 1", len(networks))
+	}
+	want := []Route{
+		{Target: netip.MustParsePrefix("192.0.2.0/24")},
+		{Target: netip.MustParsePrefix("0.0.0.0/0"), Via: netip.MustParseAddr("192.0.2.1"), Metric: 7},
+	}
+	for name, config := range map[string]*VirtualNetworkConfig{
+		"callback":      callbackConfig,
+		"NetworkConfig": node.NetworkConfig(nwid),
+		"Networks":      &networks[0],
+	} {
+		t.Run(name, func(t *testing.T) {
+			if config == nil || config.Status != NetworkStatusOK {
+				t.Fatal("persisted network configuration was not accepted")
+			}
+			if !slices.Equal(config.Routes, want) {
+				t.Fatalf("Routes = %+v, want %+v", config.Routes, want)
+			}
+		})
+	}
 }
 
 func TestNodeCloseIsIdempotent(t *testing.T) {

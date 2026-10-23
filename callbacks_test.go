@@ -102,14 +102,20 @@ func TestCallbackPanicDoesNotCrossCgo(t *testing.T) {
 }
 
 func callbackPanicChild(t *testing.T) {
-	logged := false
+	configLogged, eventLogged := false, false
 	callbacks := testNodeCallbacks()
 	callbacks.VirtualNetworkConfig = func(uint64, VirtualNetworkConfigOperation, *VirtualNetworkConfig) int {
 		panic("callback exploded")
 	}
+	callbacks.Event = func(Event, any) {
+		panic("event callback exploded")
+	}
 	callbacks.Logger = func(message string) {
 		if strings.Contains(message, "panic in VirtualNetworkConfig callback: callback exploded") {
-			logged = true
+			configLogged = true
+		}
+		if strings.Contains(message, "panic in Event callback: event callback exploded") {
+			eventLogged = true
 		}
 	}
 
@@ -119,8 +125,9 @@ func callbackPanicChild(t *testing.T) {
 	}
 	_ = node.Join(0x8056c2e21c000001)
 	node.Close()
-	if !logged {
-		t.Fatal("callback panic was not reported to Logger")
+	node.Close()
+	if !configLogged || !eventLogged {
+		t.Fatalf("missing panic logs: VirtualNetworkConfig=%v Event=%v", configLogged, eventLogged)
 	}
 }
 

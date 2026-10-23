@@ -227,18 +227,13 @@ func goEventCallback(handle C.uintptr_t, event C.int, data unsafe.Pointer) {
 }
 
 func (n *Node) emitEvent(event Event, data any) {
+	defer recoverCallbackPanic(&n, "Event")
 	if event == EventDown {
 		n.downOnce.Do(func() {
-			n.invokeEvent(event, data)
+			n.callbacks.Event(event, data)
 		})
 		return
 	}
-	n.invokeEvent(event, data)
-}
-
-func (n *Node) invokeEvent(event Event, data any) {
-	node := n
-	defer recoverCallbackPanic(&node, "Event")
 	n.callbacks.Event(event, data)
 }
 

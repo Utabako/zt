@@ -2,14 +2,12 @@ package zt
 
 /*
 #include <stdbool.h>
-#include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include "ZeroTierOne.h"
 
 // Helper to access ss_family portably (Android bionic uses anonymous union/struct)
 static inline sa_family_t zt_ss_family(const struct sockaddr_storage *sa) { return sa->ss_family; }
-static inline void zt_set_ss_family(struct sockaddr_storage *sa, sa_family_t f) { sa->ss_family = f; }
 */
 import "C"
 
@@ -44,8 +42,8 @@ func sockaddrToAddrPort(sa *C.struct_sockaddr_storage) (netip.AddrPort, bool) {
 		copy(portBytes[:], (*[2]byte)(unsafe.Pointer(&sin6.sin6_port))[:])
 		port := binary.BigEndian.Uint16(portBytes[:])
 		addr := netip.AddrFrom16(ip)
-		if zone := zoneForScopeID(uint32(sin6.sin6_scope_id)); zone != "" {
-			addr = addr.WithZone(zone)
+		if sin6.sin6_scope_id != 0 {
+			addr = addr.WithZone(strconv.FormatUint(uint64(sin6.sin6_scope_id), 10))
 		}
 		return netip.AddrPortFrom(addr, port), true
 	default:
@@ -59,9 +57,7 @@ func addrPortToSockaddr(ap netip.AddrPort) (sa C.struct_sockaddr_storage, err er
 		return sa, fmt.Errorf("zt: invalid address %v", ap)
 	}
 
-	C.memset(unsafe.Pointer(&sa), 0, C.sizeof_struct_sockaddr_storage)
-	ap = normalizeAddrPort(ap)
-	addr := ap.Addr()
+	addr := ap.Addr().Unmap()
 	if addr.Is4() {
 		sin := (*C.struct_sockaddr_in)(unsafe.Pointer(&sa))
 		sin.sin_family = C.AF_INET
@@ -105,73 +101,15 @@ func scopeIDForZone(zone string) (uint32, error) {
 	return uint32(iface.Index), nil
 }
 
-func zoneForScopeID(scopeID uint32) string {
-	if scopeID == 0 {
-		return ""
-	}
-	return strconv.FormatUint(uint64(scopeID), 10)
-}
-
 // sockaddrToPrefix converts a C sockaddr_storage to a Go netip.Prefix.
 // ZeroTier stores the prefix length in the port field.
 func sockaddrToPrefix(sa *C.struct_sockaddr_storage) (netip.Prefix, bool) {
-	if sa == nil {
+	ap, ok := sockaddrToAddrPort(sa)
+	if !ok {
 		return netip.Prefix{}, false
 	}
-	switch C.zt_ss_family(sa) {
-	case C.AF_INET:
-		sin := (*C.struct_sockaddr_in)(unsafe.Pointer(sa))
-		var ip [4]byte
-		copy(ip[:], (*[4]byte)(unsafe.Pointer(&sin.sin_addr))[:])
-		var portBytes [2]byte
-		copy(portBytes[:], (*[2]byte)(unsafe.Pointer(&sin.sin_port))[:])
-		bits := int(binary.BigEndian.Uint16(portBytes[:]))
-		return prefixFromAddrBits(netip.AddrFrom4(ip), bits)
-	case C.AF_INET6:
-		sin6 := (*C.struct_sockaddr_in6)(unsafe.Pointer(sa))
-		var ip [16]byte
-		copy(ip[:], (*[16]byte)(unsafe.Pointer(&sin6.sin6_addr))[:])
-		var portBytes [2]byte
-		copy(portBytes[:], (*[2]byte)(unsafe.Pointer(&sin6.sin6_port))[:])
-		bits := int(binary.BigEndian.Uint16(portBytes[:]))
-		return prefixFromAddrBits(netip.AddrFrom16(ip), bits)
-	default:
-		return netip.Prefix{}, false
-	}
-}
-
-// sockaddrToAddr extracts only the IP address from a sockaddr_storage.
-func sockaddrToAddr(sa *C.struct_sockaddr_storage) (netip.Addr, bool) {
-	if sa == nil {
-		return netip.Addr{}, false
-	}
-	family := C.zt_ss_family(sa)
-	if family == 0 {
-		return netip.Addr{}, false
-	}
-	switch family {
-	case C.AF_INET:
-		sin := (*C.struct_sockaddr_in)(unsafe.Pointer(sa))
-		var ip [4]byte
-		copy(ip[:], (*[4]byte)(unsafe.Pointer(&sin.sin_addr))[:])
-		return netip.AddrFrom4(ip), true
-	case C.AF_INET6:
-		sin6 := (*C.struct_sockaddr_in6)(unsafe.Pointer(sa))
-		var ip [16]byte
-		copy(ip[:], (*[16]byte)(unsafe.Pointer(&sin6.sin6_addr))[:])
-		return netip.AddrFrom16(ip), true
-	default:
-		return netip.Addr{}, false
-	}
-}
-
-func normalizeAddrPort(ap netip.AddrPort) netip.AddrPort {
-	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
-}
-
-func prefixFromAddrBits(addr netip.Addr, bits int) (netip.Prefix, bool) {
-	p := netip.PrefixFrom(addr, bits)
-	return p, p.IsValid()
+	prefix := netip.PrefixFrom(ap.Addr(), int(ap.Port()))
+	return prefix, prefix.IsValid()
 }
 
 // convertNodeStatus converts a C ZT_NodeStatus to a Go NodeStatus.
@@ -268,12 +206,16 @@ func convertVirtualNetworkConfig(cc *C.ZT_VirtualNetworkConfig) *VirtualNetworkC
 		cr := &cc.routes[i]
 		target, ok := sockaddrToPrefix(&cr.target)
 		if !ok {
-			continue
+			if C.zt_ss_family(&cr.target) != C.AF_UNSPEC {
+				continue
+			}
+			// The C API also uses a null target for 0.0.0.0/0.
+			target = netip.PrefixFrom(netip.IPv4Unspecified(), 0)
 		}
-		via, _ := sockaddrToAddr(&cr.via)
+		via, _ := sockaddrToAddrPort(&cr.via)
 		config.Routes = append(config.Routes, Route{
 			Target: target,
-			Via:    via,
+			Via:    via.Addr(),
 			Flags:  uint16(cr.flags),
 			Metric: uint16(cr.metric),
 		})
@@ -293,8 +235,8 @@ func convertVirtualNetworkConfig(cc *C.ZT_VirtualNetworkConfig) *VirtualNetworkC
 	config.DNS.Domain = C.GoString(&cc.dns.domain[0])
 	config.DNS.Servers = make([]netip.Addr, 0, MaxDNSServers)
 	for i := 0; i < MaxDNSServers; i++ {
-		if addr, ok := sockaddrToAddr(&cc.dns.server_addr[i]); ok {
-			config.DNS.Servers = append(config.DNS.Servers, addr)
+		if addr, ok := sockaddrToAddrPort(&cc.dns.server_addr[i]); ok {
+			config.DNS.Servers = append(config.DNS.Servers, addr.Addr())
 		}
 	}
 

@@ -7,29 +7,40 @@ import (
 	"testing"
 )
 
-func TestNormalizeAddrPortUnmapsIPv4InIPv6(t *testing.T) {
+func TestSockaddrRoundTripUnmapsIPv4InIPv6(t *testing.T) {
 	mapped := netip.MustParseAddrPort("[::ffff:192.0.2.1]:9993")
-
-	if got, want := normalizeAddrPort(mapped), netip.MustParseAddrPort("192.0.2.1:9993"); got != want {
-		t.Fatalf("normalizeAddrPort() = %v, want %v", got, want)
+	sa, err := addrPortToSockaddr(mapped)
+	if err != nil {
+		t.Fatalf("addrPortToSockaddr() error = %v", err)
+	}
+	got, ok := sockaddrToAddrPort(&sa)
+	if want := netip.MustParseAddrPort("192.0.2.1:9993"); !ok || got != want {
+		t.Fatalf("sockaddrToAddrPort() = (%v, %v), want (%v, true)", got, ok, want)
 	}
 }
 
-func TestPrefixFromAddrBitsRejectsInvalidIPv4PrefixLength(t *testing.T) {
-	if _, ok := prefixFromAddrBits(netip.MustParseAddr("192.0.2.0"), 33); ok {
-		t.Fatal("prefixFromAddrBits() accepted invalid IPv4 prefix length")
+func TestSockaddrToPrefix(t *testing.T) {
+	tests := []struct {
+		name    string
+		address string
+		want    string
+	}{
+		{"IPv4", "192.0.2.1:24", "192.0.2.1/24"},
+		{"IPv6", "[2001:db8::1]:64", "2001:db8::1/64"},
+		{"invalid IPv4 prefix", "192.0.2.1:33", ""},
+		{"invalid IPv6 prefix", "[2001:db8::1]:129", ""},
 	}
-}
-
-func TestPrefixFromAddrBitsRejectsInvalidIPv6PrefixLength(t *testing.T) {
-	if _, ok := prefixFromAddrBits(netip.MustParseAddr("2001:db8::"), 129); ok {
-		t.Fatal("prefixFromAddrBits() accepted invalid IPv6 prefix length")
-	}
-}
-
-func TestPrefixFromAddrBitsReturnsValidPrefix(t *testing.T) {
-	if got, ok := prefixFromAddrBits(netip.MustParseAddr("2001:db8::"), 64); !ok || got != netip.MustParsePrefix("2001:db8::/64") {
-		t.Fatalf("prefixFromAddrBits() = (%v, %v), want (%v, true)", got, ok, netip.MustParsePrefix("2001:db8::/64"))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sa, err := addrPortToSockaddr(netip.MustParseAddrPort(tt.address))
+			if err != nil {
+				t.Fatalf("addrPortToSockaddr() error = %v", err)
+			}
+			got, ok := sockaddrToPrefix(&sa)
+			if ok != (tt.want != "") || (ok && got.String() != tt.want) {
+				t.Fatalf("sockaddrToPrefix() = (%v, %v), want %q", got, ok, tt.want)
+			}
+		})
 	}
 }
 
